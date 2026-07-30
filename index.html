@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>Majlis Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,500;0,600;1,500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body, #root { height: 100%; margin: 0; }
+  body { font-family: 'Inter', sans-serif; background:#122320; }
+  .font-serif { font-family: 'Lora', serif; }
+  ::selection { background: #C9A22755; }
+  textarea:focus, input:focus, button:focus-visible { outline: 2px solid #C9A227; outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: #2F4A44; border-radius: 4px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+function StarDivider({ className }) {
+  const stars = new Array(14).fill(0);
+  return (
+    <div className={"star-row " + (className || "")} style={{display:"flex", alignItems:"center", justifyContent:"center", gap:"12px", opacity:0.4}}>
+      {stars.map((_, i) => (
+        <svg key={i} width="9" height="9" viewBox="0 0 9 9">
+          <path d="M4.5 0L5.6 2.4L8 1L6.6 3.4L9 4.5L6.6 5.6L8 8L5.6 6.6L4.5 9L3.4 6.6L1 8L2.4 5.6L0 4.5L2.4 3.4L1 1L3.4 2.4Z" fill="#C9A227" />
+        </svg>
+      ))}
+    </div>
+  );
+}
+
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+function fmtDate(ts) { return new Date(ts).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }); }
+
+const STORAGE_KEY = "majlis-notes-sessions";
+const API_KEY_STORAGE = "majlis-notes-api-key";
+
+function App() {
+  const [sessions, setSessions] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [activeId, setActiveId] = useState(null);
+  const [query, setQuery] = useState("");
+  const [synthesizing, setSynthesizing] = useState(false);
+  const [error, setError] = useState("");
+  const [mobileShowList, setMobileShowList] = useState(true);
+  const [apiKey, setApiKey] = useState("");
+  const [showKeyModal, setShowKeyModal] = useState(false);
+  const draftTimer = useRef(null);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setSessions(parsed);
+        if (parsed.length) setActiveId(parsed[0].id);
+      }
+      const key = localStorage.getItem(API_KEY_STORAGE);
+      if (key) setApiKey(key);
+    } catch (e) {}
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    clearTimeout(draftTimer.current);
+    draftTimer.current = setTimeout(() => {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)); } catch (e) {}
+    }, 400);
+    return () => clearTimeout(draftTimer.current);
+  }, [sessions, loaded]);
+
+  const active = sessions.find((s) => s.id === activeId) || null;
+
+  const filtered = useMemo(() => {
+    if (!query.trim()) return sessions;
+    const q = query.toLowerCase();
+    return sessions.filter((s) => {
+      const hay = [
+        s.title, s.notes, s.synthesis && s.synthesis.summary,
+        ...((s.synthesis && s.synthesis.keyPoints) || []),
+        ...((s.synthesis && s.synthesis.quran) || []).map(v => `${v.reference} ${v.text} ${v.relevance}`),
+        ...((s.synthesis && s.synthesis.hadith) || []).map(h => `${h.reference} ${h.text} ${h.relevance}`),
+      ].filter(Boolean).join(" ").toLowerCase();
+      return hay.includes(q);
+    });
+  }, [sessions, query]);
+
+  function newSession() {
+    const s = { id: uid(), title: "Untitled talk", createdAt: Date.now(), notes: "", synthesis: null };
+    setSessions(prev => [s, ...prev]);
+    setActiveId(s.id);
+    setQuery("");
+    setMobileShowList(false);
+  }
+
+  function updateActive(patch) {
+    setSessions(prev => prev.map(s => s.id === activeId ? { ...s, ...patch } : s));
+  }
+
+  function deleteSession(id) {
+    setSessions(prev => prev.filter(s => s.id !== id));
+    if (activeId === id) setActiveId(null);
+  }
+
+  function saveApiKey(key) {
+    setApiKey(key);
+    try { localStorage.setItem(API_KEY_STORAGE, key); } catch (e) {}
+    setShowKeyModal(false);
+  }
+
+  async function synthesize() {
+    if (!active || !active.notes.trim()) return;
+    if (!apiKey) { setShowKeyModal(true); return; }
+    setSynthesizing(true);
+    setError("");
+    try {
+      const prompt = `You are helping a Muslim note-taker who typed rough, possibly fragmented notes while listening to an Islamic talk/lecture. Their raw notes:
+
+"""
+${active.notes}
+"""
+
+Produce a short study summary. Respond with ONLY raw JSON (no markdown fences, no commentary), matching exactly this shape:
+{
+  "title": "a short descriptive title for this talk, max 8 words",
+  "summary": "a tight 3-5 sentence synthesis of what the notes cover",
+  "keyPoints": ["3-6 short bullet points of the main takeaways"],
+  "quran": [{"reference": "Surah name and ayah number(s), e.g. Surah Al-Baqarah 2:153", "text": "a brief paraphrase (not a direct quotation) of the verse's meaning", "relevance": "one sentence on why it connects to these notes"}],
+  "hadith": [{"reference": "collection and book/number if known, e.g. Sahih Muslim, Book of Faith", "text": "a brief paraphrase (not a direct quotation) of the hadith's meaning", "relevance": "one sentence on why it connects to these notes"}]
+}
+
+Rules: Include at most 3 Quran entries and 3 Hadith entries, and only ones clearly relevant to the actual content of the notes — omit the array entirely (empty array) rather than forcing a weak match. Never invent a specific ayah or hadith number/collection you are not reasonably confident about; if unsure of the exact reference, describe the theme instead (e.g. "a hadith on sincerity of intention, collection uncertain — verify"). Paraphrase only, do not output verbatim Arabic-to-English translations verse-for-verse. Keep everything concise.`;
+
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1000,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      const data = await response.json();
+      if (data.error) throw new Error(data.error.message || "API error");
+      const text = (data.content || []).map(b => b.type === "text" ? b.text : "").join("").trim();
+      const clean = text.replace(/^```json\s*|^```\s*|```$/g, "").trim();
+      const parsed = JSON.parse(clean);
+      updateActive({
+        title: parsed.title || active.title,
+        synthesis: {
+          summary: parsed.summary || "",
+          keyPoints: parsed.keyPoints || [],
+          quran: parsed.quran || [],
+          hadith: parsed.hadith || [],
+          synthesizedAt: Date.now(),
+        },
+      });
+    } catch (e) {
+      setError("Couldn't synthesize just now — check your API key and notes, then try again. (" + e.message + ")");
+    } finally {
+      setSynthesizing(false);
+    }
+  }
+
+  const s = styles;
+
+  return (
+    <div style={s.appRoot}>
+      {showKeyModal && (
+        <div style={s.modalOverlay} onClick={() => setShowKeyModal(false)}>
+          <div style={s.modalBox} onClick={e => e.stopPropagation()}>
+            <h2 className="font-serif" style={{marginTop:0}}>Add your Anthropic API key</h2>
+            <p style={{fontSize:"13px", color:"#B7C7C2", lineHeight:1.5}}>
+              This app calls Claude directly from your browser to synthesize notes. Your key is stored only in
+              this browser's local storage and sent only to api.anthropic.com — never to any other server.
+              Get a key at <a href="https://console.anthropic.com" target="_blank" rel="noreferrer" style={{color:"#C9A227"}}>console.anthropic.com</a>.
+            </p>
+            <input
+              type="password"
+              placeholder="sk-ant-..."
+              defaultValue={apiKey}
+              id="apiKeyInput"
+              style={s.input}
+            />
+            <div style={{display:"flex", gap:"8px", marginTop:"12px"}}>
+              <button style={s.primaryBtn} onClick={() => saveApiKey(document.getElementById("apiKeyInput").value.trim())}>Save key</button>
+              <button style={s.ghostBtn} onClick={() => setShowKeyModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <header style={s.header}>
+        <div style={{display:"flex", alignItems:"center", gap:"8px"}}>
+          <span style={{color:"#C9A227", fontSize:"18px"}}>☰</span>
+          <h1 className="font-serif" style={{fontSize:"18px", margin:0, letterSpacing:"0.02em"}}>Majlis Notes</h1>
+        </div>
+        <div style={{display:"flex", gap:"8px"}}>
+          <button style={s.ghostSmallBtn} onClick={() => setShowKeyModal(true)}>{apiKey ? "API key ✓" : "Set API key"}</button>
+          <button style={s.primaryBtn} onClick={newSession}>+ New talk</button>
+        </div>
+      </header>
+
+      <div style={s.body}>
+        <aside style={{...s.sidebar, display: mobileShowList ? "flex" : "none"}} className="sidebar-desktop">
+          <div style={{padding:"12px", borderBottom:"1px solid #2F4A44"}}>
+            <input
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder="Search your summaries…"
+              style={s.input}
+            />
+          </div>
+          <div style={{flex:1, overflowY:"auto"}}>
+            {filtered.length === 0 && (
+              <p style={{fontSize:"13px", color:"#7C9992", padding:"16px", textAlign:"center"}}>
+                {sessions.length === 0 ? "No talks yet. Start one to take notes." : "Nothing matches that search."}
+              </p>
+            )}
+            {filtered.map(sess => (
+              <button
+                key={sess.id}
+                onClick={() => { setActiveId(sess.id); setMobileShowList(false); }}
+                style={{...s.sessionRow, background: activeId === sess.id ? "#1B342D" : "transparent"}}
+              >
+                <div className="font-serif" style={{fontSize:"14px", color:"#EDE6D2", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{sess.title || "Untitled talk"}</div>
+                <div style={{fontSize:"11px", color:"#7C9992", marginTop:"2px"}}>{fmtDate(sess.createdAt)}</div>
+              </button>
+            ))}
+          </div>
+        </aside>
+
+        <main style={{...s.main, display: mobileShowList ? "none" : "flex"}} className="main-desktop">
+          {!active ? (
+            <div style={{flex:1, display:"flex", alignItems:"center", justifyContent:"center", color:"#7C9992", fontSize:"14px", padding:"24px", textAlign:"center"}}>
+              Select a talk on the left, or start a new one to begin taking notes.
+            </div>
+          ) : (
+            <React.Fragment>
+              <div style={s.mainHeader}>
+                <button className="mobile-back" onClick={() => setMobileShowList(true)} style={{background:"none", border:"none", color:"#7C9992", fontSize:"18px", cursor:"pointer"}}>‹</button>
+                <input
+                  value={active.title}
+                  onChange={e => updateActive({ title: e.target.value })}
+                  className="font-serif"
+                  style={{fontSize:"17px", background:"transparent", border:"none", color:"#EDE6D2", flex:1, outline:"none"}}
+                  placeholder="Untitled talk"
+                />
+                <button onClick={() => deleteSession(active.id)} style={{background:"none", border:"none", color:"#7C9992", cursor:"pointer", fontSize:"16px"}} aria-label="Delete this talk">✕</button>
+              </div>
+
+              <div style={{flex:1, overflowY:"auto", padding:"20px", display:"flex", flexDirection:"column", gap:"20px"}}>
+                <div>
+                  <label style={{fontSize:"11px", textTransform:"uppercase", letterSpacing:"0.06em", color:"#7C9992", marginBottom:"8px", display:"block"}}>Your notes</label>
+                  <textarea
+                    value={active.notes}
+                    onChange={e => updateActive({ notes: e.target.value })}
+                    placeholder="Type as you listen…"
+                    rows={8}
+                    style={s.textarea}
+                  />
+                </div>
+
+                <button
+                  onClick={synthesize}
+                  disabled={synthesizing || !active.notes.trim()}
+                  style={{...s.synthesizeBtn, opacity: (synthesizing || !active.notes.trim()) ? 0.4 : 1, cursor: (synthesizing || !active.notes.trim()) ? "not-allowed" : "pointer"}}
+                >
+                  {synthesizing ? "Synthesizing…" : active.synthesis ? "Re-synthesize" : "✦ Synthesize summary"}
+                </button>
+
+                {error && <p style={{fontSize:"13px", color:"#D97757"}}>{error}</p>}
+
+                {active.synthesis && (
+                  <div>
+                    <StarDivider />
+                    <div style={{marginTop:"20px", display:"flex", flexDirection:"column", gap:"22px"}}>
+                      <section>
+                        <h2 className="font-serif" style={s.sectionTitle}>Summary</h2>
+                        <p style={{fontSize:"14px", lineHeight:1.6, color:"rgba(237,230,210,0.9)"}}>{active.synthesis.summary}</p>
+                      </section>
+
+                      {active.synthesis.keyPoints && active.synthesis.keyPoints.length > 0 && (
+                        <section>
+                          <h2 className="font-serif" style={s.sectionTitle}>Key points</h2>
+                          <ul style={{margin:0, padding:0, listStyle:"none", display:"flex", flexDirection:"column", gap:"6px"}}>
+                            {active.synthesis.keyPoints.map((k, i) => (
+                              <li key={i} style={{fontSize:"14px", display:"flex", gap:"8px", color:"rgba(237,230,210,0.9)"}}>
+                                <span style={{color:"#C9A227"}}>•</span> {k}
+                              </li>
+                            ))}
+                          </ul>
+                        </section>
+                      )}
+
+                      {active.synthesis.quran && active.synthesis.quran.length > 0 && (
+                        <section>
+                          <h2 className="font-serif" style={s.sectionTitle}>Related Qur'an verses</h2>
+                          <div style={{display:"flex", flexDirection:"column", gap:"10px"}}>
+                            {active.synthesis.quran.map((v, i) => (
+                              <div key={i} style={s.card}>
+                                <div style={{fontSize:"14px", fontWeight:500, color:"#EDE6D2"}}>{v.reference}</div>
+                                <p style={{fontSize:"13px", color:"rgba(237,230,210,0.8)", margin:"6px 0 0"}}>{v.text}</p>
+                                <p style={{fontSize:"12px", color:"#7C9992", marginTop:"6px", fontStyle:"italic"}}>{v.relevance}</p>
+                              </div>
+                            ))}
+                          </div>
+                        </section>
+                      )}
+
+                      {active.synthesis.hadith && active.synthesis.hadith.length > 0 && (
+                        <section>
+                          <h2 className="font-serif" style={s.sectionTitle}>Related Hadith</h2>
+                          <div style={{display:"flex", flexDirection:"column", gap:"10px"}}>
+                            {active.synthesis.hadith.map((h, i) => (
+                              <div key={i} style={s.card}>
+                                <div style={{fontSize:"14px", fontWeight:500, color:"#EDE6D2"}}>{h.reference}</div>
+                                <p style={{fontSize:"13px", color:"rgba(237,230,210,0.8)", margin:"6px 0 0"}}>{h.text}</p>
+                                <p style={{fontSize:"12px", color:"#7C9992", marginTop:"6px", fontStyle:"italic"}}>{h.relevance}</p>
+                              </div>
+                            ))}
+                          </div>
+                        </section>
+                      )}
+
+                      <p style={{fontSize:"11px", color:"#5E7A73", paddingTop:"10px", borderTop:"1px solid #1D3630"}}>
+                        AI-generated references — always verify Qur'an and Hadith citations against a trusted source
+                        (e.g. quran.com, sunnah.com) before relying on or sharing them.
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </React.Fragment>
+          )}
+        </main>
+      </div>
+
+      <style>{`
+        @media (min-width: 768px) {
+          .sidebar-desktop { display: flex !important; }
+          .main-desktop { display: flex !important; }
+          .mobile-back { display: none !important; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+const styles = {
+  appRoot: { height:"100vh", width:"100%", display:"flex", flexDirection:"column", background:"#122320", color:"#EDE6D2" },
+  header: { borderBottom:"1px solid #2F4A44", padding:"14px 18px", display:"flex", alignItems:"center", justifyContent:"space-between", flexShrink:0 },
+  body: { flex:1, display:"flex", overflow:"hidden" },
+  sidebar: { width:"100%", maxWidth:"288px", borderRight:"1px solid #2F4A44", flexDirection:"column", flexShrink:0 },
+  main: { flex:1, flexDirection:"column", overflow:"hidden" },
+  mainHeader: { borderBottom:"1px solid #2F4A44", padding:"12px 18px", display:"flex", alignItems:"center", gap:"10px", flexShrink:0 },
+  input: { width:"100%", background:"#0E1C1A", border:"1px solid #2F4A44", borderRadius:"8px", padding:"9px 10px", fontSize:"14px", color:"#EDE6D2" },
+  textarea: { width:"100%", background:"#0E1C1A", border:"1px solid #2F4A44", borderRadius:"10px", padding:"12px", fontSize:"14px", lineHeight:1.6, color:"#EDE6D2", resize:"none" },
+  sessionRow: { width:"100%", textAlign:"left", padding:"12px 16px", border:"none", borderBottom:"1px solid #1D3630", cursor:"pointer" },
+  primaryBtn: { background:"#C9A227", color:"#122320", border:"none", fontSize:"13px", fontWeight:600, padding:"8px 12px", borderRadius:"7px", cursor:"pointer" },
+  ghostBtn: { background:"transparent", color:"#EDE6D2", border:"1px solid #2F4A44", fontSize:"13px", fontWeight:500, padding:"8px 12px", borderRadius:"7px", cursor:"pointer" },
+  ghostSmallBtn: { background:"transparent", color:"#B7C7C2", border:"1px solid #2F4A44", fontSize:"12px", padding:"7px 10px", borderRadius:"7px", cursor:"pointer" },
+  synthesizeBtn: { display:"inline-flex", alignItems:"center", gap:"8px", background:"#2F6F62", color:"white", border:"none", fontSize:"14px", fontWeight:500, padding:"10px 16px", borderRadius:"8px", alignSelf:"flex-start" },
+  sectionTitle: { fontSize:"15px", color:"#C9A227", margin:"0 0 8px" },
+  card: { background:"#0E1C1A", border:"1px solid #2F4A44", borderRadius:"10px", padding:"12px" },
+  modalOverlay: { position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:50, padding:"16px" },
+  modalBox: { background:"#173029", border:"1px solid #2F4A44", borderRadius:"12px", padding:"20px", maxWidth:"420px", width:"100%" },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
