@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <title>Majlis Notes</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,500;0,600;1,500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,500;0,600;1,500&family=Inter:wght@400;500;600&family=Amiri:wght@400;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
@@ -45,6 +45,67 @@ function StarDivider({ className }) {
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 function fmtDate(ts) { return new Date(ts).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }); }
 
+// Model output uses a plain-text, section-marker format instead of JSON, so that
+// quotes, apostrophes, and Arabic text in the content can never break parsing —
+// there's no escaping to get wrong.
+function parseSynthesisResponse(raw) {
+  const getSection = (startMarker, endMarker) => {
+    const startIdx = raw.indexOf(startMarker);
+    if (startIdx === -1) return "";
+    const from = startIdx + startMarker.length;
+    const endIdx = endMarker ? raw.indexOf(endMarker, from) : -1;
+    return raw.slice(from, endIdx === -1 ? raw.length : endIdx).trim();
+  };
+
+  const title = getSection("@@TITLE@@", "@@SUMMARY@@");
+  const summary = getSection("@@SUMMARY@@", "@@KEYPOINTS@@");
+  const keyPointsRaw = getSection("@@KEYPOINTS@@", "@@QURAN@@");
+  const keyPoints = keyPointsRaw
+    .split("\n")
+    .map((l) => l.replace(/^[\s\-•\d.]+/, "").trim())
+    .filter((l) => l.length > 0 && !/^\(.*\)$/.test(l));
+
+  const quranRaw = getSection("@@QURAN@@", "@@HADITH@@");
+  const hadithRaw = getSection("@@HADITH@@", "@@END@@");
+
+  function parseFields(block) {
+    const fields = {};
+    block.split("\n").forEach((line) => {
+      const m = /^([A-Za-z]+):\s*(.*)$/.exec(line.trim());
+      if (m) fields[m[1]] = m[2].trim();
+    });
+    return fields;
+  }
+
+  const quran = quranRaw
+    .split("### VERSE")
+    .map((b) => b.trim())
+    .filter(Boolean)
+    .map(parseFields)
+    .filter((f) => f.Reference)
+    .map((f) => {
+      const v = { reference: f.Reference, text: f.Meaning || "", relevance: f.Relevance || "" };
+      if (f.Arabic) v.arabic = f.Arabic;
+      if (f.TafsirSunniSource || f.TafsirSunniSummary) {
+        v.tafsirSunni = { source: f.TafsirSunniSource || "", summary: f.TafsirSunniSummary || "" };
+      }
+      if (f.TafsirShiaSource || f.TafsirShiaSummary) {
+        v.tafsirShia = { source: f.TafsirShiaSource || "", summary: f.TafsirShiaSummary || "" };
+      }
+      return v;
+    });
+
+  const hadith = hadithRaw
+    .split("### HADITH")
+    .map((b) => b.trim())
+    .filter(Boolean)
+    .map(parseFields)
+    .filter((f) => f.Reference)
+    .map((f) => ({ reference: f.Reference, text: f.Meaning || "", relevance: f.Relevance || "" }));
+
+  return { title, summary, keyPoints, quran, hadith };
+}
+
 const STORAGE_KEY = "majlis-notes-sessions";
 const API_KEY_STORAGE = "majlis-notes-api-key";
 
@@ -58,6 +119,8 @@ function App() {
   const [mobileShowList, setMobileShowList] = useState(true);
   const [apiKey, setApiKey] = useState("");
   const [showKeyModal, setShowKeyModal] = useState(false);
+  const [followUp, setFollowUp] = useState("");
+  const [asking, setAsking] = useState(false);
   const draftTimer = useRef(null);
 
   useEffect(() => {
@@ -111,6 +174,10 @@ function App() {
     setSessions(prev => prev.map(s => s.id === activeId ? { ...s, ...patch } : s));
   }
 
+  function updateSynthesis(patch) {
+    setSessions(prev => prev.map(s => s.id === activeId ? { ...s, synthesis: { ...s.synthesis, ...patch } } : s));
+  }
+
   function deleteSession(id) {
     setSessions(prev => prev.filter(s => s.id !== id));
     if (activeId === id) setActiveId(null);
@@ -134,16 +201,36 @@ function App() {
 ${active.notes}
 """
 
-Produce a short study summary. Respond with ONLY raw JSON (no markdown fences, no commentary), matching exactly this shape:
-{
-  "title": "a short descriptive title for this talk, max 8 words",
-  "summary": "a tight 3-5 sentence synthesis of what the notes cover",
-  "keyPoints": ["3-6 short bullet points of the main takeaways"],
-  "quran": [{"reference": "Surah name and ayah number(s), e.g. Surah Al-Baqarah 2:153", "text": "a brief paraphrase (not a direct quotation) of the verse's meaning", "relevance": "one sentence on why it connects to these notes"}],
-  "hadith": [{"reference": "collection and book/number if known, e.g. Sahih Muslim, Book of Faith", "text": "a brief paraphrase (not a direct quotation) of the hadith's meaning", "relevance": "one sentence on why it connects to these notes"}]
-}
+Respond using EXACTLY this plain-text template — no JSON, no markdown, no code fences, no commentary before or after it. Keep every field's value on a single line (no internal line breaks). If a field doesn't apply or you aren't confident of it, omit that specific line entirely, but always keep the section marker lines themselves exactly as shown.
 
-Rules: Include at most 3 Quran entries and 3 Hadith entries, and only ones clearly relevant to the actual content of the notes — omit the array entirely (empty array) rather than forcing a weak match. Never invent a specific ayah or hadith number/collection you are not reasonably confident about; if unsure of the exact reference, describe the theme instead (e.g. "a hadith on sincerity of intention, collection uncertain — verify"). Paraphrase only, do not output verbatim Arabic-to-English translations verse-for-verse. Keep everything concise.`;
+@@TITLE@@
+<a short descriptive title for this talk, max 8 words>
+@@SUMMARY@@
+<a tight 3-5 sentence synthesis of what the notes cover>
+@@KEYPOINTS@@
+- <key point 1>
+- <key point 2>
+(3-6 total short bullet points of the main takeaways)
+@@QURAN@@
+(zero to 3 blocks, only for verses clearly relevant to the notes — omit this whole section's content if none are clearly relevant. Each block starts with a line reading exactly "### VERSE":)
+### VERSE
+Reference: <Surah name and ayah number(s), e.g. Surah Al-Baqarah 2:153>
+Arabic: <the Arabic text of the ayah in Uthmani script — only if you are confident of the exact wording, omit this line otherwise>
+Meaning: <a brief paraphrase, not a direct quotation, of the verse's meaning>
+Relevance: <one sentence on why it connects to these notes>
+TafsirSunniSource: <name of a well-known Sunni tafsir, e.g. Tafsir Ibn Kathir, Tafsir al-Tabari, Tafsir al-Sa'di — omit this and the next line if you can't confidently name one relevant to this verse>
+TafsirSunniSummary: <a brief paraphrased summary, 2-3 sentences, of that tafsir's explanation of this verse>
+TafsirShiaSource: <name of a well-known Shia tafsir, e.g. Tafsir al-Mizan (Allamah Tabataba'i), Majma' al-Bayan (al-Tabarsi), Tafsir al-Qummi — omit this and the next line if you can't confidently name one relevant to this verse>
+TafsirShiaSummary: <a brief paraphrased summary, 2-3 sentences, of that tafsir's explanation of this verse>
+@@HADITH@@
+(zero to 3 blocks, only for hadith clearly relevant to the notes. Each block starts with a line reading exactly "### HADITH":)
+### HADITH
+Reference: <collection and book/number if known, e.g. Sahih Muslim, Book of Faith — if unsure of the exact collection, describe the theme instead and write "collection uncertain — verify">
+Meaning: <a brief paraphrase, not a direct quotation, of the hadith's meaning>
+Relevance: <one sentence on why it connects to these notes>
+@@END@@
+
+Never invent a specific ayah number, Arabic wording, hadith reference, or tafsir source/summary you are not reasonably confident about — omit that line rather than guess. Paraphrase only — never output a verbatim verse-for-verse translation.`;
 
       const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -155,15 +242,17 @@ Rules: Include at most 3 Quran entries and 3 Hadith entries, and only ones clear
         },
         body: JSON.stringify({
           model: "claude-sonnet-4-6",
-          max_tokens: 1000,
+          max_tokens: 1500,
           messages: [{ role: "user", content: prompt }],
         }),
       });
-      const data = await response.json();
-      if (data.error) throw new Error(data.error.message || "API error");
+      const rawText = await response.text();
+      let data;
+      try { data = JSON.parse(rawText); } catch (e) { throw new Error("HTTP " + response.status + ": " + rawText.slice(0, 300)); }
+      if (data.error) throw new Error((data.error.message || "API error") + " [HTTP " + response.status + "]");
       const text = (data.content || []).map(b => b.type === "text" ? b.text : "").join("").trim();
-      const clean = text.replace(/^```json\s*|^```\s*|```$/g, "").trim();
-      const parsed = JSON.parse(clean);
+      const parsed = parseSynthesisResponse(text);
+      if (!parsed.summary) throw new Error("Response was empty or unparseable: " + text.slice(0, 300));
       updateActive({
         title: parsed.title || active.title,
         synthesis: {
@@ -175,9 +264,61 @@ Rules: Include at most 3 Quran entries and 3 Hadith entries, and only ones clear
         },
       });
     } catch (e) {
-      setError("Couldn't synthesize just now — check your API key and notes, then try again. (" + e.message + ")");
+      setError("Couldn't synthesize just now — " + e.message);
     } finally {
       setSynthesizing(false);
+    }
+  }
+
+  async function askFollowUp() {
+    if (!active || !active.synthesis || !followUp.trim()) return;
+    if (!apiKey) { setShowKeyModal(true); return; }
+    setAsking(true);
+    setError("");
+    try {
+      const prompt = `You are helping refine a study summary of an Islamic talk. Here is the original raw notes:
+
+"""
+${active.notes}
+"""
+
+Here is the current summary so far:
+
+"""
+${active.synthesis.summary}
+"""
+
+The note-taker now has a follow-up question they'd like answered and added to the summary:
+"${followUp}"
+
+Answer in 2-4 concise sentences of plain text only — no markdown, no headers, no JSON. If a Qur'an verse or Hadith is genuinely relevant, you may reference it by name (e.g. "Surah Al-Isra"), but never invent a specific ayah/hadith number or collection you aren't confident about — describe the theme instead and note it should be verified. Write it so it reads naturally as an added paragraph to the existing summary.`;
+
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 500,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      const rawText = await response.text();
+      let data;
+      try { data = JSON.parse(rawText); } catch (e) { throw new Error("HTTP " + response.status + ": " + rawText.slice(0, 300)); }
+      if (data.error) throw new Error((data.error.message || "API error") + " [HTTP " + response.status + "]");
+      const answer = (data.content || []).map(b => b.type === "text" ? b.text : "").join("").trim();
+      const updatedSummary = [active.synthesis.summary, answer].filter(Boolean).join("\n\n");
+      updateSynthesis({ summary: updatedSummary });
+      setFollowUp("");
+    } catch (e) {
+      setError("Couldn't get an answer just now — " + e.message);
+    } finally {
+      setAsking(false);
     }
   }
 
@@ -296,7 +437,12 @@ Rules: Include at most 3 Quran entries and 3 Hadith entries, and only ones clear
                     <div style={{marginTop:"20px", display:"flex", flexDirection:"column", gap:"22px"}}>
                       <section>
                         <h2 className="font-serif" style={s.sectionTitle}>Summary</h2>
-                        <p style={{fontSize:"14px", lineHeight:1.6, color:"rgba(237,230,210,0.9)"}}>{active.synthesis.summary}</p>
+                        <textarea
+                          value={active.synthesis.summary}
+                          onChange={e => updateSynthesis({ summary: e.target.value })}
+                          rows={6}
+                          style={{...s.textarea, fontSize:"14px", lineHeight:1.6}}
+                        />
                       </section>
 
                       {active.synthesis.keyPoints && active.synthesis.keyPoints.length > 0 && (
@@ -319,8 +465,27 @@ Rules: Include at most 3 Quran entries and 3 Hadith entries, and only ones clear
                             {active.synthesis.quran.map((v, i) => (
                               <div key={i} style={s.card}>
                                 <div style={{fontSize:"14px", fontWeight:500, color:"#EDE6D2"}}>{v.reference}</div>
+                                {v.arabic && (
+                                  <p dir="rtl" lang="ar" style={{fontFamily:"'Amiri','Traditional Arabic',serif", fontSize:"20px", lineHeight:2, color:"#EDE6D2", margin:"8px 0 4px"}}>{v.arabic}</p>
+                                )}
                                 <p style={{fontSize:"13px", color:"rgba(237,230,210,0.8)", margin:"6px 0 0"}}>{v.text}</p>
                                 <p style={{fontSize:"12px", color:"#7C9992", marginTop:"6px", fontStyle:"italic"}}>{v.relevance}</p>
+                                {(v.tafsirSunni || v.tafsirShia) && (
+                                  <div style={{marginTop:"10px", paddingTop:"10px", borderTop:"1px solid #1D3630", display:"flex", flexDirection:"column", gap:"8px"}}>
+                                    {v.tafsirSunni && (
+                                      <div>
+                                        <div style={{fontSize:"12px", fontWeight:600, color:"#C9A227"}}>Sunni tafsir — {v.tafsirSunni.source}</div>
+                                        <p style={{fontSize:"12px", color:"rgba(237,230,210,0.75)", marginTop:"2px"}}>{v.tafsirSunni.summary}</p>
+                                      </div>
+                                    )}
+                                    {v.tafsirShia && (
+                                      <div>
+                                        <div style={{fontSize:"12px", fontWeight:600, color:"#C9A227"}}>Shia tafsir — {v.tafsirShia.source}</div>
+                                        <p style={{fontSize:"12px", color:"rgba(237,230,210,0.75)", marginTop:"2px"}}>{v.tafsirShia.summary}</p>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             ))}
                           </div>
@@ -343,9 +508,31 @@ Rules: Include at most 3 Quran entries and 3 Hadith entries, and only ones clear
                       )}
 
                       <p style={{fontSize:"11px", color:"#5E7A73", paddingTop:"10px", borderTop:"1px solid #1D3630"}}>
-                        AI-generated references — always verify Qur'an and Hadith citations against a trusted source
-                        (e.g. quran.com, sunnah.com) before relying on or sharing them.
+                        AI-generated content — Arabic wording, translations, and tafsir summaries can contain errors
+                        or misattributions. Always verify against a trusted source (e.g. quran.com for the Arabic
+                        and translations, altafsir.com or quranx.com for Sunni tafsir, al-islam.org for Shia tafsir)
+                        before relying on or sharing them.
                       </p>
+
+                      <div style={{paddingTop:"10px", borderTop:"1px solid #1D3630", display:"flex", flexDirection:"column", gap:"8px"}}>
+                        <label style={{fontSize:"11px", textTransform:"uppercase", letterSpacing:"0.06em", color:"#7C9992"}}>Ask Claude to add to this summary</label>
+                        <div style={{display:"flex", gap:"8px"}}>
+                          <input
+                            value={followUp}
+                            onChange={e => setFollowUp(e.target.value)}
+                            onKeyDown={e => e.key === "Enter" && askFollowUp()}
+                            placeholder="e.g. What does the Qur'an say about sincerity of intention?"
+                            style={{...s.input, flex:1}}
+                          />
+                          <button
+                            onClick={askFollowUp}
+                            disabled={asking || !followUp.trim()}
+                            style={{...s.synthesizeBtn, opacity: (asking || !followUp.trim()) ? 0.4 : 1, cursor: (asking || !followUp.trim()) ? "not-allowed" : "pointer", padding:"8px 14px", fontSize:"13px"}}
+                          >
+                            {asking ? "Asking…" : "✦ Ask"}
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 )}
